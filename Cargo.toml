@@ -1,0 +1,10 @@
+[package]
+name = "tex-japanese-formatter-for-zed"
+version = "1.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
