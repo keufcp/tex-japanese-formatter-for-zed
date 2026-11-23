@@ -133,6 +133,15 @@ impl TexJapaneseFormatter {
         }
     }
 
+    /// Downloads to `path` and makes it executable.
+    fn download_executable(url: &str, path: &str) -> zed::Result<()> {
+        zed::download_file(url, path, zed::DownloadedFileType::Uncompressed)?;
+        if !matches!(zed::current_platform().0, Os::Windows) {
+            zed::make_file_executable(path)?;
+        }
+        Ok(())
+    }
+
     /// Downloads the server for `release` unless it is already present.
     /// Each release is stored in its own directory so that a new release is
     /// always picked up.
@@ -141,7 +150,7 @@ impl TexJapaneseFormatter {
         release: zed::GithubRelease,
         target: &str,
     ) -> zed::Result<String> {
-        let version_dir = format!("{VERSION_DIR_PREFIX}{}", release.version);
+        let version_dir = version_dir_name(&release.version);
         // The asset is expected to be a raw executable binary.
         // If you distribute archives, add extraction logic here.
         let binary_path = format!("{version_dir}/{}", Self::binary_filename(target));
@@ -154,13 +163,22 @@ impl TexJapaneseFormatter {
             let asset = Self::find_asset_for_target(release, target)?;
             fs::create_dir_all(&version_dir)
                 .map_err(|err| format!("Failed to create download directory: {err}"))?;
-            zed::download_file(
-                &asset.download_url,
-                &binary_path,
-                zed::DownloadedFileType::Uncompressed,
-            )?;
-            if !matches!(zed::current_platform().0, Os::Windows) {
-                zed::make_file_executable(&binary_path)?;
+
+            // Download to a temporary file and move it into place only when
+            // it is complete, so a failure never leaves a broken binary at
+            // `binary_path`.
+            let temp_path = format!("{binary_path}.download");
+            fs::remove_file(&temp_path).ok();
+            let result =
+                Self::download_executable(&asset.download_url, &temp_path).and_then(|()| {
+                    fs::rename(&temp_path, &binary_path)
+                        .map_err(|err| format!("Failed to move downloaded binary: {err}"))
+                });
+            if let Err(err) = result {
+                fs::remove_file(&temp_path).ok();
+                // Only succeeds if the directory is empty.
+                fs::remove_dir(&version_dir).ok();
+                return Err(err);
             }
         }
 
@@ -184,24 +202,38 @@ impl TexJapaneseFormatter {
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let result = Self::fetch_release()
-            .and_then(|release| Self::install_release(language_server_id, release, target))
-            .or_else(|err| Self::installed_binary(target).ok_or(err));
+        let installed = Self::fetch_release()
+            .and_then(|release| Self::install_release(language_server_id, release, target));
 
-        match &result {
+        match installed {
             Ok(path) => {
                 zed::set_language_server_installation_status(
                     language_server_id,
                     &zed::LanguageServerInstallationStatus::None,
                 );
                 self.cached_binary_path = Some(path.clone());
+                Ok(path)
             }
-            Err(err) => zed::set_language_server_installation_status(
-                language_server_id,
-                &zed::LanguageServerInstallationStatus::Failed(err.clone()),
-            ),
+            // Fall back to a previously downloaded binary. The result is not
+            // cached, so the next start of the language server checks for an
+            // update again.
+            Err(err) => match Self::installed_binary(target) {
+                Some(path) => {
+                    zed::set_language_server_installation_status(
+                        language_server_id,
+                        &zed::LanguageServerInstallationStatus::None,
+                    );
+                    Ok(path)
+                }
+                None => {
+                    zed::set_language_server_installation_status(
+                        language_server_id,
+                        &zed::LanguageServerInstallationStatus::Failed(err.clone()),
+                    );
+                    Err(err)
+                }
+            },
         }
-        result
     }
 
     fn language_server_command_inner(
@@ -303,21 +335,66 @@ impl zed::Extension for TexJapaneseFormatter {
     }
 }
 
-/// Sort key for a release tag such as `v1.10.0` or `v2.0.0-rc.1`.
-/// Numeric parts are compared as numbers, and a pre-release sorts before
-/// the release with the same numbers.
-fn version_key(tag: &str) -> (Vec<u64>, bool) {
+/// Directory name for a release tag. Characters that are not safe in a
+/// single path component (e.g. `/` in `lsp/v1.0.0`) are replaced, so the
+/// directory never nests.
+fn version_dir_name(tag: &str) -> String {
+    let safe: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{VERSION_DIR_PREFIX}{safe}")
+}
+
+/// A pre-release identifier. Numeric identifiers sort before alphanumeric
+/// ones, as in Semantic Versioning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Identifier {
+    Numeric(u64),
+    Alphanumeric(String),
+}
+
+/// A pre-release sorts before the release with the same numbers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    PreRelease(Vec<Identifier>),
+    Release,
+}
+
+/// Sort key for a release tag such as `v1.10.0` or `v2.0.0-rc.10`,
+/// following the precedence rules of Semantic Versioning. Build metadata
+/// (`+...`) is ignored and trailing zeros are dropped (`v1.2` == `v1.2.0`).
+fn version_key(tag: &str) -> (Vec<u64>, Stage) {
     let tag = tag.strip_prefix('v').unwrap_or(tag);
-    let (core, pre_release) = match tag.split_once('-') {
-        Some((core, _)) => (core, true),
-        None => (tag, false),
+    let tag = tag.split('+').next().unwrap_or(tag);
+    let (core, stage) = match tag.split_once('-') {
+        Some((core, pre)) => {
+            let identifiers = pre
+                .split('.')
+                .map(|part| match part.parse() {
+                    Ok(number) => Identifier::Numeric(number),
+                    Err(_) => Identifier::Alphanumeric(part.to_string()),
+                })
+                .collect();
+            (core, Stage::PreRelease(identifiers))
+        }
+        None => (tag, Stage::Release),
     };
-    let core = core.split('+').next().unwrap_or(core);
-    let numbers = core
+
+    let mut numbers: Vec<u64> = core
         .split('.')
         .map(|part| part.parse().unwrap_or(0))
         .collect();
-    (numbers, !pre_release)
+    while numbers.last() == Some(&0) {
+        numbers.pop();
+    }
+    (numbers, stage)
 }
 
 /// Picks the directory of the newest version among `names`, ignoring names
@@ -379,8 +456,78 @@ mod tests {
 
     #[test]
     fn version_key_handles_missing_prefix_and_metadata() {
-        assert_eq!(version_key("1.2.3"), (vec![1, 2, 3], true));
-        assert_eq!(version_key("v1.2.3+build.5"), (vec![1, 2, 3], true));
-        assert_eq!(version_key("v1.2.3-beta"), (vec![1, 2, 3], false));
+        assert_eq!(version_key("1.2.3"), (vec![1, 2, 3], Stage::Release));
+        assert_eq!(version_key("v1.2.3+build.5"), version_key("v1.2.3"));
+        // A `-` inside build metadata does not make it a pre-release.
+        assert_eq!(version_key("v1.2.3+build-5"), version_key("v1.2.3"));
+        assert_eq!(
+            version_key("v1.2.3-beta+exp.sha-1"),
+            (
+                vec![1, 2, 3],
+                Stage::PreRelease(vec![Identifier::Alphanumeric("beta".into())])
+            )
+        );
+    }
+
+    #[test]
+    fn trailing_zeros_are_ignored() {
+        assert_eq!(version_key("v1.2"), version_key("v1.2.0"));
+        assert_eq!(version_key("v1"), version_key("v1.0.0"));
+        assert!(version_key("v1.2.1") > version_key("v1.2"));
+    }
+
+    #[test]
+    fn pre_release_identifiers_follow_semver() {
+        // The precedence example from the Semantic Versioning specification.
+        let ordered = [
+            "v1.0.0-alpha",
+            "v1.0.0-alpha.1",
+            "v1.0.0-alpha.beta",
+            "v1.0.0-beta",
+            "v1.0.0-beta.2",
+            "v1.0.0-beta.11",
+            "v1.0.0-rc.1",
+            "v1.0.0",
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                version_key(pair[0]) < version_key(pair[1]),
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn newest_pre_release_is_picked() {
+        let dirs = [
+            "tex-japanese-formatter-lsp-v2.0.0-rc.9",
+            "tex-japanese-formatter-lsp-v2.0.0-rc.10",
+        ];
+        assert_eq!(
+            newest(&dirs).as_deref(),
+            Some("tex-japanese-formatter-lsp-v2.0.0-rc.10")
+        );
+    }
+
+    #[test]
+    fn version_dir_name_never_nests() {
+        assert_eq!(
+            version_dir_name("v1.0.0"),
+            "tex-japanese-formatter-lsp-v1.0.0"
+        );
+        assert_eq!(
+            version_dir_name("lsp/v1.1.0"),
+            "tex-japanese-formatter-lsp-lsp_v1.1.0"
+        );
+        assert_eq!(
+            version_dir_name("a\\b:c*d"),
+            "tex-japanese-formatter-lsp-a_b_c_d"
+        );
+        assert_eq!(
+            version_dir_name("v2.0.0-rc.1+build"),
+            "tex-japanese-formatter-lsp-v2.0.0-rc.1+build"
+        );
     }
 }
