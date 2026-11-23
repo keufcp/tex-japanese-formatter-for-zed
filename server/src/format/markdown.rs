@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use markdown::mdast::Node;
+use markdown::mdast::{Node, ReferenceKind};
 use markdown::{Constructs, ParseOptions};
 
 use super::{FormatOptions, yaml};
@@ -214,6 +214,13 @@ fn collect(node: &Node, text: &str, options: &FormatOptions, ranges: &mut Vec<Ra
             }
         }
         Node::Link(_) if is_autolink(node, text) => {}
+        // In `[label]` and `[label][]` the text is also the label that must
+        // match the definition, so converting it would break the link.
+        Node::LinkReference(reference)
+            if matches!(
+                reference.reference_kind,
+                ReferenceKind::Shortcut | ReferenceKind::Collapsed
+            ) => {}
         // Leaves that are not prose.
         Node::Code(_)
         | Node::InlineCode(_)
@@ -322,8 +329,18 @@ mod tests {
     fn keeps_image_alt_and_definitions() {
         let input = "![図、1](a.png)\n\n[参照、]: https://example.com/、\n\n本文、[参照、]です。\n";
         let expected =
-            "![図、1](a.png)\n\n[参照、]: https://example.com/、\n\n本文，[参照，]です．\n";
+            "![図、1](a.png)\n\n[参照、]: https://example.com/、\n\n本文，[参照、]です．\n";
         assert_eq!(md(input), expected);
+    }
+
+    #[test]
+    fn reference_labels_are_untouched() {
+        // Shortcut and collapsed references use their text as the label.
+        let input = "[参照、]と[参照、][]と[文字、][参照、]。\n\n[参照、]: https://e.com\n";
+        // Only the text of a full reference is converted.
+        let expected = "[参照、]と[参照、][]と[文字，][参照、]．\n\n[参照、]: https://e.com\n";
+        assert_eq!(md(input), expected);
+        assert_eq!(mdx(input), expected);
     }
 
     #[test]
