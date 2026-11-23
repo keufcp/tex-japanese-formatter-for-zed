@@ -110,9 +110,71 @@ fn is_autolink(node: &Node, text: &str) -> bool {
     byte_range(node).is_some_and(|range| !text[range].starts_with('['))
 }
 
+/// HTML elements whose content is code rather than prose.
+const CODE_ELEMENTS: [&str; 6] = ["code", "kbd", "samp", "pre", "script", "style"];
+
+fn is_code_element(name: &str) -> bool {
+    CODE_ELEMENTS.contains(&name)
+}
+
+/// For an inline HTML tag such as `<code class="x">` or `</code>`, returns
+/// the lowercase tag name and whether it is a closing tag. Self-closing tags,
+/// comments and other HTML return `None`.
+fn html_tag(html: &str) -> Option<(String, bool)> {
+    let inner = html.strip_prefix('<')?.strip_suffix('>')?;
+    if inner.ends_with('/') {
+        return None;
+    }
+    let (closing, inner) = match inner.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, inner),
+    };
+    let name: String = inner
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_ascii_lowercase(), closing))
+}
+
+/// Collects the children of a node. In Markdown, inline HTML is not a tree:
+/// `<code>a</code>` is three siblings. Siblings between the opening and the
+/// closing tag of a code element are skipped.
+fn collect_children(
+    children: &[Node],
+    text: &str,
+    options: &FormatOptions,
+    ranges: &mut Vec<Range<usize>>,
+) {
+    let mut open_code_elements = 0usize;
+    for child in children {
+        if let Node::Html(html) = child
+            && let Some((name, closing)) = html_tag(&html.value)
+            && is_code_element(&name)
+        {
+            if closing {
+                open_code_elements = open_code_elements.saturating_sub(1);
+            } else {
+                open_code_elements += 1;
+            }
+            continue;
+        }
+        if open_code_elements == 0 {
+            collect(child, text, options, ranges);
+        }
+    }
+}
+
 fn collect(node: &Node, text: &str, options: &FormatOptions, ranges: &mut Vec<Range<usize>>) {
     match node {
         Node::Text(_) => ranges.extend(byte_range(node)),
+        // MDX: `<code>`, `<kbd>`, ... are elements whose content is code.
+        Node::MdxJsxTextElement(element)
+            if element.name.as_deref().is_some_and(is_code_element) => {}
+        Node::MdxJsxFlowElement(element)
+            if element.name.as_deref().is_some_and(is_code_element) => {}
         Node::Yaml(_) => {
             if let Some(range) = byte_range(node) {
                 ranges.extend(frontmatter_ranges(text, range, options));
@@ -144,9 +206,7 @@ fn collect(node: &Node, text: &str, options: &FormatOptions, ranges: &mut Vec<Ra
         | Node::ThematicBreak(_) => {}
         _ => {
             if let Some(children) = node.children() {
-                for child in children {
-                    collect(child, text, options, ranges);
-                }
+                collect_children(children, text, options, ranges);
             }
         }
     }
@@ -253,6 +313,49 @@ mod tests {
         let input = "<div title=\"、\">\n、\n</div>\n\n本文<span>、</span>。\n";
         let expected = "<div title=\"、\">\n、\n</div>\n\n本文<span>，</span>．\n";
         assert_eq!(md(input), expected);
+    }
+
+    #[test]
+    fn keeps_inline_code_elements_in_markdown() {
+        let input = concat!(
+            "本文<code>a、b</code>です。\n\n",
+            "<kbd>、</kbd>と<script>a、</script>と<CODE class=\"x\">、</CODE>。\n\n",
+            "<code>x<b>、</b>y</code>後、\n\n",
+            "改行<br/>、と<span>、</span>。\n",
+        );
+        let expected = concat!(
+            "本文<code>a、b</code>です．\n\n",
+            "<kbd>、</kbd>と<script>a、</script>と<CODE class=\"x\">、</CODE>．\n\n",
+            "<code>x<b>、</b>y</code>後，\n\n",
+            "改行<br/>，と<span>，</span>．\n",
+        );
+        assert_eq!(md(input), expected);
+    }
+
+    #[test]
+    fn keeps_code_elements_in_mdx() {
+        let input = concat!(
+            "本文<code>a、b</code>です。\n\n",
+            "<pre>\n  a、b\n</pre>\n\n",
+            "<Code>部品、</Code>と<kbd>、</kbd>。\n",
+        );
+        // `Code` is a component, not the HTML element, so its text is prose.
+        let expected = concat!(
+            "本文<code>a、b</code>です．\n\n",
+            "<pre>\n  a、b\n</pre>\n\n",
+            "<Code>部品，</Code>と<kbd>、</kbd>．\n",
+        );
+        assert_eq!(mdx(input), expected);
+    }
+
+    #[test]
+    fn html_tag_names() {
+        use super::html_tag;
+        assert_eq!(html_tag("<code>"), Some(("code".into(), false)));
+        assert_eq!(html_tag("</CODE>"), Some(("code".into(), true)));
+        assert_eq!(html_tag("<code class=\"x\">"), Some(("code".into(), false)));
+        assert_eq!(html_tag("<br/>"), None);
+        assert_eq!(html_tag("<!-- c -->"), None);
     }
 
     #[test]
