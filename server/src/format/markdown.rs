@@ -106,10 +106,11 @@ fn esm_is_complete(source: &str) -> bool {
                     chars = rest;
                 }
             }
-            // A regular expression literal, e.g. `/'/` or `/[{]/`.
+            // A regular expression literal, e.g. `/'/` or `/[{]/`. `<` is not
+            // in the list because `</` is a JSX closing tag.
             '/' if chars.peek() != Some(&'/')
                 && chars.peek() != Some(&'*')
-                && (previous == '\0' || "(,=:[!&|?{};+-*%<>~^".contains(previous)) =>
+                && (previous == '\0' || "(,=:[!&|?{};+-*%>~^".contains(previous)) =>
             {
                 if let Some(rest) = skip_literal(chars.clone(), '/') {
                     chars = rest;
@@ -459,6 +460,21 @@ mod tests {
         let expected =
             "export const re = /'/\n\nexport const a = <div>it's</div>\n\n本文，です．\n";
         assert_eq!(mdx(input), expected);
+    }
+
+    #[test]
+    fn mdx_esm_with_jsx_closing_tags() {
+        let esm = concat!(
+            "export const List = ({items}) => (\n",
+            "  <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>\n",
+            ")\n",
+            "\n",
+            "export const Nums = () => <div>{[1, 2].map(n => <span>{n}</span>)}</div>\n",
+            "\n",
+        );
+        let input = format!("{esm}本文、です。\n");
+        let expected = format!("{esm}本文，です．\n");
+        assert_eq!(mdx(&input), expected);
     }
 
     #[test]
