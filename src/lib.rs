@@ -101,16 +101,17 @@ impl TexJapaneseFormatter {
     }
 
     /// Finds a previously downloaded binary, used when GitHub is unreachable.
-    /// The newest version wins.
+    /// See `fallback_version_dir` for which version is chosen.
     fn installed_binary(target: &str) -> Option<String> {
         let filename = Self::binary_filename(target);
-        let directories = fs::read_dir(".")
+        let directories: Vec<String> = fs::read_dir(".")
             .ok()?
             .flatten()
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| Self::is_file(&format!("{name}/{filename}")));
+            .filter(|name| Self::is_file(&format!("{name}/{filename}")))
+            .collect();
 
-        newest_version_dir(directories)
+        fallback_version_dir(directories, RELEASE_TAG)
             .map(|dir| format!("{dir}/{filename}"))
             .or_else(|| {
                 Some(format!("{LEGACY_DOWNLOAD_DIR}/{filename}")).filter(|p| Self::is_file(p))
@@ -368,10 +369,11 @@ enum Stage {
 }
 
 /// Sort key for a release tag such as `v1.10.0` or `v2.0.0-rc.10`,
-/// following the precedence rules of Semantic Versioning. Build metadata
-/// (`+...`) is ignored and trailing zeros are dropped (`v1.2` == `v1.2.0`).
+/// following the precedence rules of Semantic Versioning. Anything before
+/// the first digit (`v`, `V`, `lsp_v`, ...) is ignored, as is build metadata
+/// (`+...`). Trailing zeros are dropped (`v1.2` == `v1.2.0`).
 fn version_key(tag: &str) -> (Vec<u64>, Stage) {
-    let tag = tag.strip_prefix('v').unwrap_or(tag);
+    let tag = tag.trim_start_matches(|c: char| !c.is_ascii_digit());
     let tag = tag.split('+').next().unwrap_or(tag);
     let (core, stage) = match tag.split_once('-') {
         Some((core, pre)) => {
@@ -407,6 +409,19 @@ fn newest_version_dir(names: impl Iterator<Item = String>) -> Option<String> {
         })
         .max()
         .map(|(_, name)| name)
+}
+
+/// Picks the version directory to fall back to. When a release is pinned
+/// with `RELEASE_TAG`, that version is preferred so that a version the pin
+/// was meant to avoid does not start; otherwise the newest version wins.
+fn fallback_version_dir(names: Vec<String>, pinned_tag: Option<&str>) -> Option<String> {
+    if let Some(tag) = pinned_tag {
+        let pinned_dir = version_dir_name(tag);
+        if names.contains(&pinned_dir) {
+            return Some(pinned_dir);
+        }
+    }
+    newest_version_dir(names.into_iter())
 }
 
 zed::register_extension!(TexJapaneseFormatter);
@@ -529,5 +544,42 @@ mod tests {
             version_dir_name("v2.0.0-rc.1+build"),
             "tex-japanese-formatter-lsp-v2.0.0-rc.1+build"
         );
+    }
+
+    #[test]
+    fn tags_with_non_numeric_prefixes_sort_correctly() {
+        assert!(version_key("lsp_v2.0.0") > version_key("lsp_v1.9.0"));
+        assert!(version_key("lsp-v10.0.0") > version_key("lsp-v9.0.0"));
+        assert_eq!(version_key("V1.2.3"), version_key("v1.2.3"));
+        assert_eq!(version_key("lsp_v1.2.3"), (vec![1, 2, 3], Stage::Release));
+
+        let dirs = [
+            version_dir_name("lsp/v1.9.0"),
+            version_dir_name("lsp/v2.0.0"),
+        ];
+        assert_eq!(
+            newest_version_dir(dirs.iter().cloned()),
+            Some(version_dir_name("lsp/v2.0.0"))
+        );
+    }
+
+    #[test]
+    fn fallback_prefers_pinned_release() {
+        let dirs = || vec![version_dir_name("v1.0.0"), version_dir_name("v1.1.0")];
+        assert_eq!(
+            fallback_version_dir(dirs(), Some("v1.0.0")),
+            Some(version_dir_name("v1.0.0"))
+        );
+        // Without a pin, or when the pinned version is not installed, the
+        // newest version is used.
+        assert_eq!(
+            fallback_version_dir(dirs(), None),
+            Some(version_dir_name("v1.1.0"))
+        );
+        assert_eq!(
+            fallback_version_dir(dirs(), Some("v0.9.0")),
+            Some(version_dir_name("v1.1.0"))
+        );
+        assert_eq!(fallback_version_dir(Vec::new(), Some("v1.0.0")), None);
     }
 }
