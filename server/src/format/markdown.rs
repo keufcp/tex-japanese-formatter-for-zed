@@ -52,134 +52,38 @@ fn parse_options(flavor: Flavor) -> ParseOptions {
     }
 }
 
-/// A lightweight stand-in for a JavaScript parser: an ESM block is complete
-/// once brackets, strings, template literals and comments are closed.
-/// Otherwise markdown-rs is asked to feed more lines (e.g. past blank lines
-/// inside an exported function).
+/// Parses an MDX ESM block (`import` / `export`) with a JavaScript parser.
+///
+/// markdown-rs calls this at each blank line. If the code ends in the middle
+/// of a statement (e.g. a blank line inside an exported function), `Eof`
+/// asks it to feed more lines.
 fn esm_signal(source: &str) -> markdown::MdxSignal {
-    if esm_is_complete(source) {
-        markdown::MdxSignal::Ok
+    let allocator = oxc_allocator::Allocator::default();
+    let result = oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::jsx()).parse();
+    let Some(error) = result.diagnostics.errors().next() else {
+        return markdown::MdxSignal::Ok;
+    };
+
+    let source_name = Box::new("tex-japanese-formatter".to_string());
+    let rule_id = Box::new("esm".to_string());
+    // An error that reaches the end of the code means more lines are needed:
+    // "Expected `}` but found EOF" points at the end, and an unterminated
+    // template literal or comment spans up to it.
+    let content_end = source.trim_end().len();
+    let spans: Vec<(usize, usize)> = error
+        .labels
+        .iter()
+        .map(|label| {
+            let start = label.offset() as usize;
+            (start, start + label.len() as usize)
+        })
+        .collect();
+    if spans.is_empty() || spans.iter().any(|&(_, end)| end >= content_end) {
+        markdown::MdxSignal::Eof(error.message.to_string(), source_name, rule_id)
     } else {
-        markdown::MdxSignal::Eof(
-            "unexpected end of ESM".to_string(),
-            Box::new("tex-japanese-formatter".to_string()),
-            Box::new("esm".to_string()),
-        )
+        let offset = spans.iter().map(|&(start, _)| start).min().unwrap_or(0);
+        markdown::MdxSignal::Error(error.message.to_string(), offset, source_name, rule_id)
     }
-}
-
-fn esm_is_complete(source: &str) -> bool {
-    // `{` opened inside a template literal (`${`) is marked with `$`.
-    let mut stack: Vec<char> = Vec::new();
-    let mut chars = source.chars().peekable();
-    // The last non-whitespace character, used to tell regexes from division.
-    let mut previous_significant = '\0';
-
-    while let Some(c) = chars.next() {
-        if stack.last() == Some(&'`') {
-            match c {
-                '\\' => {
-                    chars.next();
-                }
-                '`' => {
-                    stack.pop();
-                }
-                '$' if chars.peek() == Some(&'{') => {
-                    chars.next();
-                    stack.push('$');
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        let previous = previous_significant;
-        if !c.is_whitespace() {
-            previous_significant = c;
-        }
-
-        match c {
-            // Strings cannot span lines. A quote that is not closed on its
-            // line is not a string (e.g. `it's` in JSX text).
-            '\'' | '"' => {
-                if let Some(rest) = skip_literal(chars.clone(), c) {
-                    chars = rest;
-                }
-            }
-            // A regular expression literal, e.g. `/'/` or `/[{]/`. `<` is not
-            // in the list because `</` is a JSX closing tag.
-            '/' if chars.peek() != Some(&'/')
-                && chars.peek() != Some(&'*')
-                && (previous == '\0' || "(,=:[!&|?{};+-*%>~^".contains(previous)) =>
-            {
-                if let Some(rest) = skip_literal(chars.clone(), '/') {
-                    chars = rest;
-                }
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut closed = false;
-                let mut previous = '\0';
-                for next in chars.by_ref() {
-                    if previous == '*' && next == '/' {
-                        closed = true;
-                        break;
-                    }
-                    previous = next;
-                }
-                if !closed {
-                    return false;
-                }
-            }
-            '`' | '(' | '[' | '{' => stack.push(c),
-            ')' | ']' | '}' => {
-                let expected = match c {
-                    ')' => '(',
-                    ']' => '[',
-                    _ => '{',
-                };
-                match stack.last() {
-                    Some(&open) if open == expected || (c == '}' && open == '$') => {
-                        stack.pop();
-                    }
-                    // Stray closing bracket: let the block end here.
-                    _ => return true,
-                }
-            }
-            _ => {}
-        }
-    }
-
-    stack.is_empty()
-}
-
-/// Skips a string or regular expression literal whose opening `delimiter`
-/// has been consumed. Returns `None` if it is not closed on the same line.
-fn skip_literal(
-    mut chars: std::iter::Peekable<std::str::Chars<'_>>,
-    delimiter: char,
-) -> Option<std::iter::Peekable<std::str::Chars<'_>>> {
-    let mut in_class = false;
-    while let Some(next) = chars.next() {
-        match next {
-            '\\' => {
-                chars.next();
-            }
-            '\n' => return None,
-            '[' if delimiter == '/' => in_class = true,
-            ']' if delimiter == '/' => in_class = false,
-            _ if next == delimiter && !in_class => return Some(chars),
-            _ => {}
-        }
-    }
-    None
 }
 
 pub fn convertible_ranges(
@@ -428,30 +332,49 @@ mod tests {
     }
 
     #[test]
-    fn esm_completeness() {
-        use super::esm_is_complete;
-        assert!(esm_is_complete("import a from 'b'"));
-        assert!(esm_is_complete("export const a = { b: [1, (2)] }"));
-        assert!(esm_is_complete("export const s = `x${ {a: 1}.a }y`"));
-        assert!(esm_is_complete("export const s = '}' // {\n"));
-        assert!(esm_is_complete("export const s = /* { */ 1"));
-        assert!(!esm_is_complete("export function f() {\n"));
-        assert!(!esm_is_complete("export const s = `abc"));
-        assert!(!esm_is_complete("export const s = /* abc"));
-        // A quote that is not closed on its line is not a string.
-        assert!(esm_is_complete("export const s = 'abc"));
-        assert!(esm_is_complete("export const a = <div>it's</div>"));
-        // Regular expression literals.
-        assert!(esm_is_complete("export const re = /'/"));
-        assert!(esm_is_complete("export const re = /`/g"));
-        assert!(esm_is_complete("export const re = /[{(]/"));
-        assert!(esm_is_complete("export const re = /\\//"));
-        assert!(!esm_is_complete(
-            "export const f = (a) => a.match(/[}]/) && {\n"
-        ));
-        // Division is not a regular expression.
-        assert!(esm_is_complete("export const a = (4) / 2 / (1)"));
-        assert!(esm_is_complete("export const a = b / 2, c = '/'"));
+    fn esm_signals() {
+        use super::esm_signal;
+        use markdown::MdxSignal;
+
+        let kind = |source: &str| match esm_signal(source) {
+            MdxSignal::Ok => "ok",
+            MdxSignal::Eof(..) => "eof",
+            MdxSignal::Error(..) => "error",
+        };
+
+        for source in [
+            "import a from 'b'",
+            "export const a = { b: [1, (2)] }",
+            "export const s = `x${ {a: 1}.a }y`",
+            "export const s = '}' // {\n",
+            "export const s = /* { */ 1",
+            "export const a = <div>it's</div>",
+            "export const re = /'/",
+            "export const re = /`/g",
+            "export const re = /[{(]/",
+            "export const re = /\\//",
+            "export const a = (4) / 2 / (1)",
+            "export const a = b / 2, c = '/'",
+            "export function f(x) {\n  return /{/.test(x)\n}",
+            "export const G = ({s}) => <div>{s.map((x) => <img src={x} />)}</div>",
+            "export const L = () => <li>https://x.com</li>",
+            "export const A = () => <p>(注</p>",
+        ] {
+            assert_eq!(kind(source), "ok", "{source}");
+        }
+
+        // Incomplete code: more lines are needed.
+        for source in [
+            "export function f() {\n",
+            "export const s = `abc",
+            "export const s = /* abc",
+            "export const f = (a) => a.match(/[}]/) && {\n",
+        ] {
+            assert_eq!(kind(source), "eof", "{source}");
+        }
+
+        // Invalid code before the end.
+        assert_eq!(kind("export const = 1\nexport const a = 2"), "error");
     }
 
     #[test]
@@ -470,6 +393,27 @@ mod tests {
             ")\n",
             "\n",
             "export const Nums = () => <div>{[1, 2].map(n => <span>{n}</span>)}</div>\n",
+            "\n",
+        );
+        let input = format!("{esm}本文、です。\n");
+        let expected = format!("{esm}本文，です．\n");
+        assert_eq!(mdx(&input), expected);
+    }
+
+    #[test]
+    fn mdx_esm_with_jsx_text_and_self_closing_tags() {
+        // Cases reported in review: `/>`, a URL and an unmatched `(` in JSX
+        // text, and a regular expression right after `return`.
+        let esm = concat!(
+            "export const G = ({s}) => (\n",
+            "  <div>{s.map((x) => <img src={x} />)}</div>\n",
+            ")\n",
+            "\n",
+            "export const L = ({ls}) => <ul>{ls.map((l) => <li key={l}>https://x.com</li>)}</ul>\n",
+            "\n",
+            "export const A = () => <p>(注、</p>\n",
+            "\n",
+            "export function f(x) {\n  return /{/.test(x)\n}\n",
             "\n",
         );
         let input = format!("{esm}本文、です。\n");
