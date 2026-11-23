@@ -51,10 +51,16 @@ pub fn value_ranges(source: &str, exclude_keys: &[String]) -> Vec<Range<usize>> 
             }
             Event::Alias(_) => {
                 let (is_key, _) = node_role(&stack, exclude_keys);
+                if is_key {
+                    forget_top_level_key(&mut stack);
+                }
                 finish_node(&mut stack, is_key);
             }
             Event::MappingStart(..) | Event::SequenceStart(..) => {
                 let (is_key, convert) = node_role(&stack, exclude_keys);
+                if is_key {
+                    forget_top_level_key(&mut stack);
+                }
                 stack.push(Container {
                     is_mapping: matches!(event, Event::MappingStart(..)),
                     expect_key: true,
@@ -120,6 +126,14 @@ fn node_role(stack: &[Container], exclude_keys: &[String]) -> (bool, bool) {
             .as_ref()
             .is_some_and(|key| exclude_keys.iter().any(|excluded| excluded == key));
     (false, !excluded)
+}
+
+/// A top-level key that is not a scalar (`? [k]`, `*alias`) has no name to
+/// match against the excluded keys, so the previous key name is dropped.
+fn forget_top_level_key(stack: &mut [Container]) {
+    if let [top_level] = stack {
+        top_level.current_key = None;
+    }
 }
 
 fn finish_node(stack: &mut [Container], was_key: bool) {
@@ -201,6 +215,19 @@ mod tests {
     fn complex_keys_are_not_converted() {
         let source = "? [鍵、]\n: 値、\n";
         assert_eq!(convert(source, &[]), "? [鍵、]\n: 値，\n");
+    }
+
+    #[test]
+    fn non_scalar_key_after_excluded_key() {
+        // The value after a complex or alias key does not inherit the
+        // exclusion of the previous key.
+        let source = "slug: a、\n? [k]\n: 値、\n";
+        assert_eq!(convert(source, &["slug"]), "slug: a、\n? [k]\n: 値，\n");
+        let source = "x: &k 鍵\nslug: a、\n*k : 値、\n";
+        assert_eq!(
+            convert(source, &["slug"]),
+            "x: &k 鍵\nslug: a、\n*k : 値，\n"
+        );
     }
 
     #[test]
