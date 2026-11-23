@@ -412,8 +412,9 @@ fn newest_version_dir(names: impl Iterator<Item = String>) -> Option<String> {
 }
 
 /// Picks the version directory to fall back to. When a release is pinned
-/// with `RELEASE_TAG`, that version is preferred so that a version the pin
-/// was meant to avoid does not start; otherwise the newest version wins.
+/// with `RELEASE_TAG` and that version is installed, it is used. Otherwise
+/// the newest installed version is used, even if the pin was meant to avoid
+/// it: starting some version beats having no formatter while offline.
 fn fallback_version_dir(names: Vec<String>, pinned_tag: Option<&str>) -> Option<String> {
     if let Some(tag) = pinned_tag {
         let pinned_dir = version_dir_name(tag);
