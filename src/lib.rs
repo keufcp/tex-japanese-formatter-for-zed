@@ -64,16 +64,6 @@ impl TexJapaneseFormatter {
         }
     }
 
-    fn ensure_repo_configured() -> zed::Result<()> {
-        if GITHUB_OWNER == "CHANGE_ME_OWNER" || GITHUB_REPO == "CHANGE_ME_REPO" {
-            return Err(
-                "GitHub repository is not configured in src/lib.rs (GITHUB_OWNER / GITHUB_REPO)"
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
     fn find_asset_for_target(
         release: zed::GithubRelease,
         target: &str,
@@ -96,8 +86,6 @@ impl TexJapaneseFormatter {
     }
 
     fn fetch_release() -> zed::Result<zed::GithubRelease> {
-        Self::ensure_repo_configured()?;
-
         let repo = format!("{GITHUB_OWNER}/{GITHUB_REPO}");
         if let Some(tag) = RELEASE_TAG {
             zed::github_release_by_tag_name(&repo, tag)
