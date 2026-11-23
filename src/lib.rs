@@ -263,7 +263,8 @@ impl TexJapaneseFormatter {
         zed::serde_json::json!({
             "enabled": true,
             "formatOnSave": true,
-            "targetLanguages": ["latex"]
+            "targetLanguages": ["latex"],
+            "frontmatterExcludeKeys": []
         })
     }
 
