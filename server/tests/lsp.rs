@@ -216,6 +216,19 @@ fn configuration_changes_are_applied() {
 }
 
 #[test]
+fn empty_configuration_keeps_current_settings() {
+    let mut client = Client::start(json!({ "targetLanguages": ["mdx"] }));
+    client.open("file:///doc.mdx", "mdx", "本文、です。\n");
+
+    client.notify(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": {} }),
+    );
+    // MDX is still a target; the empty object did not reset to LaTeX only.
+    assert_eq!(client.format("file:///doc.mdx").len(), 2);
+}
+
+#[test]
 fn invalid_mdx_is_left_untouched() {
     let mut client = Client::start(json!({ "targetLanguages": ["mdx"] }));
     client.open("file:///broken.mdx", "mdx", "<Note>\n本文、\n");

@@ -21,15 +21,27 @@ impl Default for FormatterConfig {
     }
 }
 
+const KNOWN_KEYS: [&str; 4] = [
+    "enabled",
+    "formatOnSave",
+    "targetLanguages",
+    "frontmatterExcludeKeys",
+];
+
 impl FormatterConfig {
     /// Builds a config from either the settings object itself or a value that
-    /// wraps it in a `settings` field. Returns `None` if the value is malformed.
+    /// wraps it in a `settings` field. Missing fields take their defaults.
+    ///
+    /// Returns `None` if the value is malformed or contains none of the known
+    /// keys (e.g. `{}`), so that such a value does not silently reset the
+    /// current config to the defaults.
     pub fn from_value(value: &serde_json::Value) -> Option<Self> {
         let settings = match value.get("settings") {
             Some(inner) if inner.is_object() => inner,
             _ => value,
         };
-        if !settings.is_object() {
+        let object = settings.as_object()?;
+        if !KNOWN_KEYS.iter().any(|key| object.contains_key(*key)) {
             return None;
         }
         serde_json::from_value(settings.clone()).ok()
@@ -65,5 +77,17 @@ mod tests {
     fn rejects_malformed_values() {
         assert!(FormatterConfig::from_value(&json!(null)).is_none());
         assert!(FormatterConfig::from_value(&json!({ "enabled": "yes" })).is_none());
+    }
+
+    #[test]
+    fn rejects_values_without_known_keys() {
+        assert!(FormatterConfig::from_value(&json!({})).is_none());
+        assert!(FormatterConfig::from_value(&json!({ "settings": {} })).is_none());
+        assert!(
+            FormatterConfig::from_value(&json!({
+                "tex-japanese-formatter": { "targetLanguages": ["mdx"] }
+            }))
+            .is_none()
+        );
     }
 }
