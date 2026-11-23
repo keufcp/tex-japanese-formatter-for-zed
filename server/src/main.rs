@@ -117,8 +117,14 @@ impl LanguageServer for Backend {
         let options = FormatOptions {
             frontmatter_exclude_keys: &config.frontmatter_exclude_keys,
         };
-        match format::convertible_ranges(language_id, &doc.text, &options) {
-            Ok(ranges) => Ok(Some(format::text_edits(&doc.text, &ranges))),
+        let result = format::convertible_ranges(language_id, &doc.text, &options)
+            .map(|ranges| format::text_edits(&doc.text, &ranges));
+        // Release the lock before awaiting the client, so that document
+        // updates are not blocked while the log message is being sent.
+        drop(documents);
+
+        match result {
+            Ok(edits) => Ok(Some(edits)),
             Err(message) => {
                 self.client
                     .log_message(
