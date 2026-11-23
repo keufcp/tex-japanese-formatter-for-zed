@@ -45,7 +45,9 @@ pub fn value_ranges(source: &str, exclude_keys: &[String]) -> Vec<Range<usize>> 
                 } else if convert {
                     let start = to_byte(span.start.index());
                     let end = to_byte(span.end.index());
-                    ranges.push(scalar_content_start(source, start, end, style)..end);
+                    let start = scalar_content_start(source, start, end, style);
+                    let end = quoted_scalar_end(source, start, end, style);
+                    ranges.push(start..end);
                 }
                 finish_node(&mut stack, is_key);
             }
@@ -105,6 +107,34 @@ fn scalar_content_start(source: &str, start: usize, end: usize, style: ScalarSty
         }
     }
     position
+}
+
+/// The span of a quoted scalar may extend to a comment on the same line
+/// (`"x" # comment`). Returns the position just after the closing quote.
+fn quoted_scalar_end(source: &str, start: usize, end: usize, style: ScalarStyle) -> usize {
+    let quote = match style {
+        ScalarStyle::SingleQuoted => '\'',
+        ScalarStyle::DoubleQuoted => '"',
+        _ => return end,
+    };
+    let text = &source[start..end];
+    let mut chars = text.char_indices();
+    if chars.next().map(|(_, c)| c) != Some(quote) {
+        return end;
+    }
+    while let Some((index, c)) = chars.next() {
+        // `\"` escapes in double quotes, `''` in single quotes.
+        if quote == '"' && c == '\\' {
+            chars.next();
+        } else if c == quote {
+            if quote == '\'' && text[index + 1..].starts_with('\'') {
+                chars.next();
+            } else {
+                return start + index + 1;
+            }
+        }
+    }
+    end
 }
 
 /// Determines whether the next node is a mapping key and whether its
@@ -179,6 +209,25 @@ mod tests {
             convert("# 注、\na: 値、 # 注、\n", &[]),
             "# 注、\na: 値， # 注、\n"
         );
+    }
+
+    #[test]
+    fn comments_after_quoted_values_are_untouched() {
+        let source = concat!(
+            "title: \"論文\" # 仮題、後で直す\n",
+            "a: 'x、' # c、\n",
+            "b: \"x、\\\"y、\\\"\" # \"c、\"\n",
+            "c: 'it''s、' # d、\n",
+            "list:\n  - \"x、\" # e、\n",
+        );
+        let expected = concat!(
+            "title: \"論文\" # 仮題、後で直す\n",
+            "a: 'x，' # c、\n",
+            "b: \"x，\\\"y，\\\"\" # \"c、\"\n",
+            "c: 'it''s，' # d、\n",
+            "list:\n  - \"x，\" # e、\n",
+        );
+        assert_eq!(convert(source, &[]), expected);
     }
 
     #[test]
